@@ -1,5 +1,10 @@
 # can-bus-lab
 
+[![CI](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/workflows/ci.yml/badge.svg)](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.8%20%7C%203.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)
+![Dependencies](https://img.shields.io/badge/runtime%20dependencies-none-success)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 **一句话定位**：一个**纯 Python 标准库**实现的 CAN / CAN FD 总线仿真器 + 类 CAPL 脚本化测试框架 —— 把一个汽车电子测试工程师每天在做的事（周期报文监控、诊断流程、故障码读写、总线仲裁验证、故障注入与恢复），用**可复现、可验证、每一行代码都能讲清楚**的方式实现出来。
 
 它的目标不是替代任何商业工具，而是把「CAN 总线到底是怎么工作的」和「测试脚本到底是怎么驱动总线的」这两件事讲透：**从位级编码开始，到总线仲裁、错误状态机、ISO-TP 传输层、UDS 诊断、再到自己写的脚本引擎与自动化测试报告**，全部自研，全部有测试。
@@ -370,7 +375,17 @@ $ python -m pytest tests/ -q
 
 - 平台：`ubuntu-latest` + `windows-latest`
 - Python：3.8 + 3.12
-- 步骤：安装 pytest → 跑全部测试 → 逐个跑 6 个 demo 脚本（断言必须全过）→ 校验 JUnit 报告生成且可解析
+- 步骤：安装 pytest → 跑全部测试 → 跑内置自检 → 逐个跑 6 个 demo 脚本（断言必须全过）→ 校验 JUnit 报告生成且可解析 → 校验同 seed 两次运行报告逐字节一致 → 上传报告产物
+
+**CI 实跑结果（绿）**：4 个 job 全部通过，两个平台、两个 Python 版本上
+都是 `1065 passed`，6 个 demo 报告合计 `cases=6 assertions=114 failures=0 errors=0`。
+
+运行记录：[CI run #38625444437](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/runs/38625444437)
+（commit `dcc4397`）
+
+> 附注：CI 第一次跑是**红的**——不是逻辑问题，而是 `canlab selftest` 在 Windows runner
+> 上撞了 `UnicodeEncodeError`（runner 的 stdout 编码是 cp1252，而工具会打印中文）。
+> 修法与排查过程记在下面的「踩到的坑」第 13、14 条。
 
 ---
 
