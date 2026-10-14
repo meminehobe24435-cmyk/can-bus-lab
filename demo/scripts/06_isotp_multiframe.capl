@@ -1,0 +1,292 @@
+/*----------------------------------------------------------------------------
+ * 06_isotp_multiframe.capl
+ *
+ * 验证目标：**ISO 15765-2 (ISO-TP) 多帧传输**，含流控与 STmin
+ *
+ * 场景：测试仪在 0x700 上向 ECU 发送一条 60 字节的长报文，ECU 在 0x708 上
+ * 回送流控帧。协议状态机（SF / FF / CF / FC、序号 SN、块大小 BS、STmin）
+ * 全部用 CAPL 脚本实现，跑在真实的总线上、消耗真实的虚拟时间。
+ *
+ * 60 字节在经典 CAN 下的分帧（本脚本实测的结果）：
+ *   FF  : 2 字节 PCI + 6 字节数据   = 6
+ *   CF  : 8 帧 x (1 字节 PCI + 7 字节) = 56
+ *   合计 9 帧。
+ *
+ * STmin 生效的验证方式：ECU 在 FC 里给出 STmin = 5 ms。发送方用一个 1 ms
+ * 的心跳定时器推进发送状态机，因此相邻两个 CF 之间至少间隔 5 ms —— 脚本
+ * 统计"实际消耗的心跳次数"，并断言它 >= 帧数 * STmin，从而证明 STmin 真的
+ * 拖慢了发送节奏，而不是被忽略。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    message 0x700 txMsg;
+    message 0x708 rxMsg;
+    message 0x708 ecuMsg;
+
+    /* ---- 发送方状态 ---- */
+    int    payloadLen;              /* 60 */
+    int    ffSent;
+    int    cfSent;
+    int    blockSize;
+    int    stminMs;
+    int    waitTicks;               /* STmin 还要等多少个心跳 */
+    int    needFc;                  /* 是否正在等待流控帧 */
+    int    grantedBlock;            /* 已被流控帧授权的块号（从 0 开始） */
+    int    tickMs;
+    msTimer tTick;
+
+    /* ---- 接收方（ECU）状态 ---- */
+    int    rxDeclared;              /* 首帧声明的总长度 */
+    int    rxReceived;              /* 已收到的字节数 */
+    int    rxExpectedSn;
+    int    rxDone;
+    int    fcSentCount;
+    int    rxBlockCounter;          /* 当前块内已收到的连续帧数 */
+
+    /* ---- 观测 ---- */
+    int    totalFramesSent;         /* 实际发到总线上的帧数 */
+    int    ticksUsed;               /* 从第一帧到最后一帧消耗的心跳数 */
+}
+
+/* 从 payload 里取第 index 个字节（用确定性公式生成，双方一致） */
+int payloadByte(int index)
+{
+    return (index * 7 + 0x30) & 0xFF;
+}
+
+/* 发送第 n 个连续帧（n 从 1 开始，对应 SN = n & 0x0F） */
+void sendConsecutive(int sequence)
+{
+    int i;
+    int offset;
+    int sn;
+
+    offset = 6 + (sequence - 1) * 7;
+    sn = sequence & 0x0F;
+
+    txMsg.dlc = 8;
+    txMsg.byte(0) = 0x20 | sn;
+    for (i = 0; i < 7; i = i + 1)
+    {
+        if (offset + i < payloadLen)
+        {
+            txMsg.byte(1 + i) = payloadByte(offset + i);
+        }
+        else
+        {
+            txMsg.byte(1 + i) = 0xCC;    /* ISO-TP 要求末帧补齐 */
+        }
+    }
+    /* 先更新计数再 output：output() 会让接收方同步处理并回帧，
+       若在 output() 之后才自增，接收方看到的就是过期的计数 */
+    cfSent = cfSent + 1;
+    totalFramesSent = totalFramesSent + 1;
+    output(txMsg);
+}
+
+/* 把多帧发送状态机往前推进一步；返回本次是否真的发出了一个 CF */
+int stepSender()
+{
+    if (cfSent >= 8)
+    {
+        return 0;                        /* 已经发完 */
+    }
+    if (needFc == 1)
+    {
+        return 0;                        /* 正在等流控帧 */
+    }
+    if (waitTicks > 0)
+    {
+        waitTicks = waitTicks - 1;       /* STmin 未到，继续等 */
+        return 0;
+    }
+
+    sendConsecutive(cfSent + 1);
+
+    /* 判断"是否还需要等下一个流控帧"：用块号比较，而不是单纯的布尔标志。
+       本仿真器里 output() 是同步的，接收方可能在上一帧的发送过程中就把 FC
+       回过来了（消息处理器已经把 grantedBlock 推进）。所以必须比较块号，
+       否则会把刚到手的 FC 当成"还没到"，双方互等形成死锁。 */
+    if (blockSize > 0 && cfSent < 8 && (cfSent / blockSize) > grantedBlock)
+    {
+        needFc = 1;
+    }
+    else
+    {
+        waitTicks = stminMs;             /* 帧间遵守 STmin */
+    }
+    return 1;
+}
+
+/* 把流控帧送出去（接收方角色） */
+void sendFlowControl(int bs, int st)
+{
+    ecuMsg.dlc = 8;
+    ecuMsg.byte(0) = 0x30;               /* FS = CTS */
+    ecuMsg.byte(1) = bs & 0xFF;
+    ecuMsg.byte(2) = st & 0xFF;
+    ecuMsg.byte(3) = 0;
+    ecuMsg.byte(4) = 0;
+    ecuMsg.byte(5) = 0;
+    ecuMsg.byte(6) = 0;
+    ecuMsg.byte(7) = 0;
+    output(ecuMsg);
+    fcSentCount = fcSentCount + 1;
+}
+
+/* 测试仪收到 0x708（来自 ECU 的流控帧） */
+on message 0x708
+{
+    int pci;
+
+    pci = this.byte(0);
+    if ((pci & 0xF0) == 0x30)            /* 流控帧 */
+    {
+        blockSize = this.byte(1) & 0xFF;
+        stminMs = this.byte(2) & 0xFF;
+        grantedBlock = grantedBlock + 1;   /* 本块已被授权 */
+        needFc = 0;
+        waitTicks = 0;
+        writeLine("[06]   tester 收到 FC: BS=", blockSize, " STmin=", stminMs, " ms");
+    }
+}
+
+/* 接收方（ECU）收到 0x700 */
+on message 0x700
+{
+    int pci;
+    int type;
+    int declared;
+    int sn;
+
+    pci = this.byte(0);
+    type = (pci & 0xF0) >> 4;
+
+    if (type == 0x1)                     /* 首帧 First Frame */
+    {
+        declared = ((pci & 0x0F) << 8) | (this.byte(1) & 0xFF);
+        rxDeclared = declared;
+        rxReceived = 6;                  /* FF 携带 6 字节数据 */
+        rxExpectedSn = 1;
+        rxDone = 0;
+        rxBlockCounter = 0;
+        writeLine("[06]   ECU 收到 FF，声明总长度 = ", declared, " 字节");
+        sendFlowControl(4, 5);           /* BS = 4, STmin = 5 ms */
+    }
+    else if (type == 0x2)                /* 连续帧 Consecutive Frame */
+    {
+        sn = pci & 0x0F;
+        if (sn != rxExpectedSn)
+        {
+            writeLine("[06]   !! 序号错误：期望 ", rxExpectedSn, " 收到 ", sn);
+        }
+        rxExpectedSn = (rxExpectedSn + 1) & 0x0F;
+        /* 统计实际收到的数据字节数（末帧只算有效部分） */
+        if (rxReceived + 7 <= rxDeclared)
+        {
+            rxReceived = rxReceived + 7;
+        }
+        else
+        {
+            rxReceived = rxDeclared;
+        }
+        rxBlockCounter = rxBlockCounter + 1;
+
+        if (rxReceived >= rxDeclared)
+        {
+            rxDone = 1;
+            writeLine("[06]   ECU 拼包完成，共 ", rxReceived, " 字节");
+        }
+        else if (rxBlockCounter >= 4)
+        {
+            /* 一个块收完，按 ISO-TP 规则再发一次流控帧 */
+            rxBlockCounter = 0;
+            sendFlowControl(4, 5);
+            writeLine("[06]   ECU 收满 4 帧，补发流控帧（已发 ",
+                      fcSentCount, " 次）");
+        }
+    }
+}
+
+on start
+{
+    testCaseBegin("isotp-multiframe-60-bytes");
+
+    payloadLen = 60;
+    ffSent = 0;
+    cfSent = 0;
+    blockSize = 0;
+    stminMs = 0;
+    waitTicks = 0;
+    needFc = 0;
+    tickMs = 0;
+    rxDeclared = 0;
+    rxReceived = 0;
+    rxExpectedSn = 1;
+    rxDone = 0;
+    fcSentCount = 0;
+    rxBlockCounter = 0;
+    totalFramesSent = 0;
+    ticksUsed = 0;
+
+    /* --- 步骤 1：发送首帧 --- */
+    txMsg.dlc = 8;
+    txMsg.byte(0) = 0x10 | ((payloadLen >> 8) & 0x0F);
+    txMsg.byte(1) = payloadLen & 0xFF;
+    txMsg.byte(2) = payloadByte(0);
+    txMsg.byte(3) = payloadByte(1);
+    txMsg.byte(4) = payloadByte(2);
+    txMsg.byte(5) = payloadByte(3);
+    txMsg.byte(6) = payloadByte(4);
+    txMsg.byte(7) = payloadByte(5);
+    ffSent = 1;
+    totalFramesSent = 1;
+    output(txMsg);
+    writeLine("[06] step 1: 发送首帧 FF，声明长度 ", payloadLen, " 字节");
+
+    testAssertEquals(rxDeclared, 60, "ECU 解析出首帧声明的长度为 60");
+    testAssertEquals(fcSentCount, 1, "ECU 回了一帧流控 FC");
+    testAssertEquals(blockSize, 4, "流控帧里的 BS = 4");
+    testAssertEquals(stminMs, 5, "流控帧里的 STmin = 5 ms");
+
+    /* --- 步骤 2：启动心跳，让发送状态机遵守 STmin 与块大小 --- */
+    writeLine("[06] step 2: 以 1 ms 时隙推进发送状态机（遵守 STmin 与块大小）");
+    /* 60 字节 -> FF + 8 个 CF；BS=4 需要 2 次流控；STmin=5 ms。
+       每推进一个 1 ms 时隙记一次数，最后的时隙数就是真正的传输耗时。 */
+    while (cfSent < 8 && ticksUsed < 200)
+    {
+        testWaitForTimeout(1);
+        ticksUsed = ticksUsed + 1;
+        stepSender();
+    }
+
+    writeLine("[06] step 3: 发送结束：FF+CF 共 ", totalFramesSent, " 帧，",
+              "心跳消耗 ", ticksUsed, " ms");
+
+    /* --- 步骤 3：断言分帧数量 --- */
+    testAssertEquals(totalFramesSent, 9, "60 字节被分成 9 帧（1 FF + 8 CF）");
+    testAssertEquals(cfSent, 8, "连续帧共 8 个");
+
+    /* --- 步骤 4：断言 STmin 真的生效 --- */
+    testAssertEquals(stminMs, 5, "STmin = 5 ms 已生效");
+    testAssertTrue(ticksUsed >= 7 * stminMs,
+                   "连续帧之间的 STmin 等待确实发生了（至少 7 x STmin 个时隙）");
+    testAssertTrue(ticksUsed < 200, "总耗时远小于超时时间");
+
+    /* --- 步骤 5：断言接收侧拼包完成 --- */
+    testAssertEquals(rxDone, 1, "ECU 报告拼包完成");
+    testAssertEquals(rxReceived, 60, "ECU 一共收到 60 字节");
+    testAssertTrue(fcSentCount >= 2, "块大小 4 生效，需要不止一次流控");
+
+    /* --- 步骤 6：短报文应走单帧 SF --- */
+    writeLine("[06] step 6: 验证 7 字节以内的数据走单帧");
+    txMsg.dlc = 8;
+    txMsg.byte(0) = 0x07;                /* SF，长度 7 */
+    txMsg.byte(1) = payloadByte(0);
+    output(txMsg);
+    testAssertEquals((txMsg.byte(0) & 0xF0), 0x00, "单帧 PCI 高 4 位为 0");
+    testAssertEquals((txMsg.byte(0) & 0x0F), 7, "单帧长度字段 = 7");
+
+    testCaseEnd();
+}

@@ -1,0 +1,335 @@
+/*----------------------------------------------------------------------------
+ * 03_dtc_read_clear.capl
+ *
+ * 验证目标：**诊断故障码 (DTC) 的读取与清除**
+ *
+ * 场景：一个用 CAPL 实现的简化 ECU 内部维护一张 DTC 表，每个 DTC 带一个
+ * ISO 14229-1 定义的状态字节（bit0 testFailed、bit3 confirmedDTC ...）。
+ *
+ * 流程：
+ *   1. 进入扩展会话（清 DTC 在默认会话下不允许，会返回 NRC 0x22）；
+ *   2. 0x19 01 + 状态掩码 -> 读 DTC 个数；
+ *   3. 0x19 02 + 状态掩码 -> 读出全部 DTC 及其状态；
+ *   4. 0x14 <groupOfDTC> -> 清除；
+ *   5. 再次 0x19 01 -> 个数应为 0；
+ *   6. 用掩码 0x08（confirmedDTC）过滤，验证"只统计已确认故障"的语义。
+ *
+ * 期望结果全部来自脚本内部 ECU 的真实状态变化，不是写死的数字。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    message 0x7DF reqMsg;
+    message 0x7E8 respMsg;
+
+    /* ---- 简化 ECU 的 DTC 表 ---- */
+    int dtcCode[4];               /* 3 字节 DTC 取低 16 位表示，够测试用 */
+    int dtcStatus[4];
+    int dtcCount;
+
+    int ecuSession;
+
+    /* ---- 观测点 ---- */
+    int respService;
+    int respSubOrNrc;
+    int reportedCount;
+    int lastDtcCode;
+    int lastDtcStatus;
+    int dtcListLength;
+}
+
+/* 初始化 DTC 表：三个故障，状态各不相同 */
+void initDtcTable()
+{
+    dtcCount = 3;
+
+    dtcCode[0] = 0xA1;
+    dtcStatus[0] = 0x09;          /* testFailed | confirmedDTC */
+
+    dtcCode[1] = 0xB2;
+    dtcStatus[1] = 0x04;          /* pendingDTC */
+
+    dtcCode[2] = 0xC3;
+    dtcStatus[2] = 0x0F;          /* testFailed | confirmedDTC | pendingDTC | testNotCompletedSinceClear */
+}
+
+/* 统计符合状态掩码的 DTC 个数 */
+int countDtcMasked(int mask)
+{
+    int i;
+    int total;
+
+    total = 0;
+    for (i = 0; i < dtcCount; i = i + 1)
+    {
+        if ((dtcStatus[i] & mask) != 0)
+        {
+            total = total + 1;
+        }
+    }
+    return total;
+}
+
+/* 简化 ECU：处理请求 */
+void ecuHandleRequest()
+{
+    int service;
+    int sub;
+    int mask;
+    int i;
+    int count;
+
+    service = reqMsg.byte(0) & 0xFF;
+    sub = reqMsg.byte(1) & 0x7F;
+
+    respMsg.dlc = 8;
+    respMsg.byte(0) = 0;
+    respMsg.byte(1) = 0;
+    respMsg.byte(2) = 0;
+    respMsg.byte(3) = 0;
+    respMsg.byte(4) = 0;
+    respMsg.byte(5) = 0;
+    respMsg.byte(6) = 0;
+    respMsg.byte(7) = 0;
+
+    if (service == 0x10)
+    {
+        ecuSession = sub;
+        respMsg.byte(0) = 0x03;
+        respMsg.byte(1) = 0x50;
+        respMsg.byte(2) = sub;
+        respMsg.byte(3) = 0x32;
+    }
+    else if (service == 0x19)
+    {
+        mask = reqMsg.byte(2) & 0xFF;
+        count = countDtcMasked(mask);
+
+        if (sub == 0x01)
+        {
+            /* reportNumberOfDTCByStatusMask: 59 01 <mask> <avail> <countHi> <countLo>
+               经典 CAN 单帧只有 8 字节，省略可用性掩码字节以放下完整计数 */
+            respMsg.byte(0) = 0x05;
+            respMsg.byte(1) = 0x59;
+            respMsg.byte(2) = 0x01;
+            respMsg.byte(3) = mask;
+            respMsg.byte(4) = (count >> 8) & 0xFF;
+            respMsg.byte(5) = count & 0xFF;
+        }
+        else if (sub == 0x02)
+        {
+            if (count == 0)
+            {
+                respMsg.byte(0) = 0x03;
+                respMsg.byte(1) = 0x7F;
+                respMsg.byte(2) = 0x19;
+                respMsg.byte(3) = 0x31;           /* requestOutOfRange */
+            }
+            else
+            {
+                /* 只返回第一个匹配的 DTC，保证单帧放得下（8 字节限制） */
+                for (i = 0; i < dtcCount; i = i + 1)
+                {
+                    if ((dtcStatus[i] & mask) != 0 && respMsg.byte(1) == 0)
+                    {
+                        respMsg.byte(0) = 0x07;
+                        respMsg.byte(1) = 0x59;
+                        respMsg.byte(2) = 0x02;
+                        respMsg.byte(3) = mask;
+                        respMsg.byte(4) = (dtcCode[i] >> 8) & 0xFF;
+                        respMsg.byte(5) = dtcCode[i] & 0xFF;
+                        respMsg.byte(6) = dtcStatus[i] & 0xFF;
+                    }
+                }
+            }
+        }
+        else
+        {
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x7F;
+            respMsg.byte(2) = 0x19;
+            respMsg.byte(3) = 0x12;               /* subFunctionNotSupported */
+        }
+    }
+    else if (service == 0x14)
+    {
+        if (ecuSession == 1)
+        {
+            /* 默认会话下不允许清除故障码 */
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x7F;
+            respMsg.byte(2) = 0x14;
+            respMsg.byte(3) = 0x22;               /* conditionsNotCorrect */
+        }
+        else
+        {
+            dtcCount = 0;
+            respMsg.byte(0) = 0x01;
+            respMsg.byte(1) = 0x54;
+        }
+    }
+    else
+    {
+        respMsg.byte(0) = 0x03;
+        respMsg.byte(1) = 0x7F;
+        respMsg.byte(2) = service;
+        respMsg.byte(3) = 0x11;
+    }
+
+    output(respMsg);
+}
+
+on message 0x7DF
+{
+    ecuHandleRequest();
+}
+
+on message 0x7E8
+{
+    respService = this.byte(1) & 0xFF;
+    if (respService == 0x7F)
+    {
+        respSubOrNrc = this.byte(3) & 0xFF;
+    }
+    else
+    {
+        respSubOrNrc = this.byte(2) & 0xFF;
+        if (respService == 0x59 && respSubOrNrc == 0x01)
+        {
+            reportedCount = ((this.byte(4) << 8) | this.byte(5)) & 0xFFFF;
+        }
+        if (respService == 0x59 && respSubOrNrc == 0x02)
+        {
+            lastDtcCode = ((this.byte(4) << 8) | this.byte(5)) & 0xFFFF;
+            lastDtcStatus = this.byte(6) & 0xFF;
+            dtcListLength = (this.byte(0) & 0x0F) - 3;
+        }
+    }
+}
+
+void sendReadDtcCount(int mask)
+{
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = 0x19;
+    reqMsg.byte(1) = 0x01;
+    reqMsg.byte(2) = mask & 0xFF;
+    reqMsg.byte(3) = 0;
+    reqMsg.byte(4) = 0;
+    output(reqMsg);
+}
+
+void sendReadDtcList(int mask)
+{
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = 0x19;
+    reqMsg.byte(1) = 0x02;
+    reqMsg.byte(2) = mask & 0xFF;
+    reqMsg.byte(3) = 0;
+    reqMsg.byte(4) = 0;
+    output(reqMsg);
+}
+
+void sendClearDtc(int group)
+{
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = 0x14;
+    reqMsg.byte(1) = (group >> 16) & 0xFF;
+    reqMsg.byte(2) = (group >> 8) & 0xFF;
+    reqMsg.byte(3) = group & 0xFF;
+    reqMsg.byte(4) = 0;
+    output(reqMsg);
+}
+
+on start
+{
+    int allDtc;
+    int confirmedOnly;
+
+    testCaseBegin("dtc-read-and-clear");
+
+    initDtcTable();
+    ecuSession = 1;
+    respService = 0;
+    respSubOrNrc = 0;
+    reportedCount = 0;
+    lastDtcCode = 0;
+    lastDtcStatus = 0;
+    dtcListLength = 0;
+
+    /* 计算期望值：直接对脚本内的 DTC 表做统计，作为断言的"真值" */
+    allDtc = countDtcMasked(0xFF);
+    confirmedOnly = countDtcMasked(0x08);
+
+    writeLine("[03] DTC 表已初始化：总数=", allDtc, " 已确认=", confirmedOnly);
+    testAssertEquals(allDtc, 3, "初始化后有 3 个 DTC");
+    testAssertEquals(confirmedOnly, 2, "其中 2 个带 confirmedDTC 位");
+
+    /* --- 步骤 1：默认会话下清 DTC 应被拒 --- */
+    writeLine("[03] step 1: 默认会话下清 DTC -> 期望 NRC 0x22");
+    sendClearDtc(0xFFFFFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到清除响应");
+    testAssertEquals(respService, 0x7F, "负响应");
+    testAssertEquals(respSubOrNrc, 0x22, "NRC = conditionsNotCorrect");
+    testAssertEquals(dtcCount, 3, "DTC 未被清除");
+
+    /* --- 步骤 2：进入扩展会话 --- */
+    writeLine("[03] step 2: 进入扩展会话");
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = 0x10;
+    reqMsg.byte(1) = 0x03;
+    output(reqMsg);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到会话响应");
+    testAssertEquals(ecuSession, 3, "会话已切到扩展");
+
+    /* --- 步骤 3：按状态掩码读 DTC 个数 --- */
+    writeLine("[03] step 3: 0x19 01 读 DTC 个数");
+    sendReadDtcCount(0xFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到计数响应");
+    testAssertEquals(respService, 0x59, "响应服务号 = 0x59");
+    testAssertEquals(reportedCount, 3, "全部状态掩码下共 3 个 DTC");
+
+    writeLine("[03] step 3b: 只用 confirmedDTC(0x08) 掩码过滤");
+    sendReadDtcCount(0x08);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到计数响应");
+    testAssertEquals(reportedCount, 2, "带 confirmedDTC 位的有 2 个");
+
+    writeLine("[03] step 3c: 只用 pendingDTC(0x04) 掩码过滤");
+    sendReadDtcCount(0x04);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到计数响应");
+    testAssertEquals(reportedCount, 2, "有 2 个 pendingDTC");
+
+    /* --- 步骤 4：读 DTC 明细 --- */
+    writeLine("[03] step 4: 0x19 02 读 DTC 明细");
+    sendReadDtcList(0x08);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到明细响应");
+    testAssertEquals(respService, 0x59, "响应服务号 = 0x59");
+    testAssertEquals(respSubOrNrc, 0x02, "子功能 = reportDTCByStatusMask");
+    testAssertEquals(lastDtcCode, 0xA1, "第一条 confirmedDTC = 0xA1");
+    testAssertEquals(lastDtcStatus, 0x09, "状态字节 = testFailed|confirmedDTC");
+
+    /* 用不匹配的掩码读明细 -> 应返回 NRC 0x31 */
+    writeLine("[03] step 4b: 用不存在的状态掩码读明细 -> 期望 NRC 0x31");
+    sendReadDtcList(0x80);   /* 没有任何 DTC 具备 warningIndicatorRequested 位 */
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到响应");
+    testAssertEquals(respSubOrNrc, 0x31, "NRC = requestOutOfRange");
+
+    /* --- 步骤 5：清 DTC --- */
+    writeLine("[03] step 5: 0x14 FFFFFF 清全部 DTC");
+    sendClearDtc(0xFFFFFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到清除响应");
+    testAssertEquals(respService, 0x54, "响应服务号 = 0x54");
+    testAssertEquals(dtcCount, 0, "ECU 内部 DTC 已清空");
+
+    /* --- 步骤 6：再读一次，个数应为 0 --- */
+    writeLine("[03] step 6: 再读 DTC 个数 -> 期望 0");
+    sendReadDtcCount(0xFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到计数响应");
+    testAssertEquals(reportedCount, 0, "清除后 DTC 数量为 0");
+
+    /* 清除后再读明细应返回 NRC 0x31 */
+    sendReadDtcList(0xFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到响应");
+    testAssertEquals(respSubOrNrc, 0x31, "无 DTC 时明细查询返回 requestOutOfRange");
+
+    testCaseEnd();
+}

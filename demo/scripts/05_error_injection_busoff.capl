@@ -1,0 +1,147 @@
+/*----------------------------------------------------------------------------
+ * 05_error_injection_busoff.capl
+ *
+ * 验证目标：**五类错误检测 + TEC/REC 计数 + bus-off 恢复**
+ *
+ * 场景：一个"故障节点" ECU_X 在总线上反复发送报文，但每一帧都被注入位错误
+ * （等价于它的收发器 / 回读路径出问题）。按照 ISO 11898-1 的故障界定规则：
+ *
+ *   1. 每检测到一次发送错误，TEC += 8；
+ *   2. TEC > 127 时节点从 error-active 进入 error-passive；
+ *   3. TEC > 255 时节点进入 bus-off，脱离总线并拒绝发送；
+ *   4. 恢复条件：检测到 128 次"连续 11 个隐性位"（即 1408 个隐性位）之后，
+ *      TEC/REC 归零并回到 error-active。
+ *
+ * 脚本会**精确测出**恢复所需的隐性位个数与虚拟时间，而不是猜一个数字。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    message 0x300 faultMsg;
+
+    int injectionCount;
+    int peakTec;
+    int tecAtPassive;
+    int passiveReached;
+    int busOffReached;
+    int idleBitsTotal;         /* 恢复过程累计推进的隐性位数 */
+    int recoveredAtBits;       /* 恢复发生时的累计隐性位数（-1 表示未恢复） */
+    int tecAfterRecovery;
+    int recoveredStateOk;
+}
+
+on start
+{
+    int tec;
+    int denied;
+    int step;
+
+    testCaseBegin("error-injection-and-bus-off");
+
+    injectionCount = 0;
+    peakTec = 0;
+    tecAtPassive = 0;
+    passiveReached = 0;
+    busOffReached = 0;
+    idleBitsTotal = 0;
+    recoveredAtBits = -1;
+    tecAfterRecovery = 0;
+    recoveredStateOk = 0;
+
+    faultMsg.dlc = 8;
+
+    /* --- 阶段 1：反复注入位错误，观察 TEC 增长与状态迁移 --- */
+    writeLine("[05] 阶段 1：持续注入位错误，观察 TEC 与错误状态机");
+    while (busOffReached == 0 && injectionCount < 64)
+    {
+        injectBitError("ECU_X", 20);
+        nodeSend("ECU_X", 0x300, injectionCount & 0xFF);
+        injectionCount = injectionCount + 1;
+
+        tec = nodeTec("ECU_X");
+        if (tec > peakTec)
+        {
+            peakTec = tec;
+        }
+        if (passiveReached == 0 && nodeErrorState("ECU_X") == "error-passive")
+        {
+            passiveReached = 1;
+            tecAtPassive = tec;
+            writeLine("[05]   第 ", injectionCount,
+                      " 次注入后进入 error-passive，TEC = ", tec);
+        }
+        if (nodeIsBusOff("ECU_X") == 1)
+        {
+            busOffReached = 1;
+        }
+    }
+    writeLine("[05]   共注入 ", injectionCount, " 次位错误；TEC 峰值 = ", peakTec,
+              "；最终状态 = ", nodeErrorState("ECU_X"));
+
+    testAssertTrue(passiveReached == 1, "节点经历过 error-passive");
+    testAssertTrue(tecAtPassive > 127, "进入 error-passive 时 TEC > 127");
+    testAssertTrue(busOffReached == 1, "节点最终进入 bus-off");
+    testAssertTrue(peakTec > 255, "TEC 峰值超过 bus-off 阈值 255");
+    testAssertEquals(injectionCount, 32, "每次错误 +8，32 次错误达到 bus-off");
+    testAssertEquals(errorCount("ECU_X", "bit"), injectionCount,
+                     "位错误计数与实际注入次数一致");
+    testAssertEquals(nodeErrorFrames("ECU_X"), injectionCount,
+                     "每次检测到错误都发出了错误帧");
+
+    /* --- 阶段 2：bus-off 期间拒绝发送 --- */
+    denied = nodeSend("ECU_X", 0x300, 0xEE);
+    testAssertEquals(denied, 0, "bus-off 状态下发送被拒绝");
+
+    /* --- 阶段 3：以 1 ms 为步长推进空闲，精确找出恢复点 --- */
+    writeLine("[05] 阶段 3：以 1 ms 为步长推进总线空闲，定位恢复点");
+    step = 0;
+    while (recoveredAtBits < 0 && step < 40)
+    {
+        idleBitsTotal = idleBitsTotal + busIdleMs(1);   /* 1 ms = 500 位 */
+        step = step + 1;
+        if (nodeIsBusOff("ECU_X") == 0)
+        {
+            recoveredAtBits = idleBitsTotal;
+        }
+    }
+
+    writeLine("[05]   恢复发生在累计推进 ", recoveredAtBits, " 个隐性位时（",
+              step, " ms 虚拟时间）");
+    testAssertTrue(recoveredAtBits > 0, "总线上出现足够空闲后节点恢复");
+    /* 每步推进 1 ms = 500 位，所以观测到的恢复位总数必然落在
+       (1408, 1408 + 500] 区间内：真实恢复点在 1408 位，脚本在下一步才发现。 */
+    testAssertTrue(recoveredAtBits > 1408, "恢复点在 1408 个隐性位之后");
+    testAssertTrue(recoveredAtBits <= 1408 + 500,
+                   "恢复点在 1408 个隐性位之后的第一个观测步内");
+
+    /* --- 阶段 4：恢复后的状态 --- */
+    tecAfterRecovery = nodeTec("ECU_X");
+    testAssertEquals(tecAfterRecovery, 0, "恢复后 TEC 归零");
+    testAssertEquals(nodeRec("ECU_X"), 0, "恢复后 REC 归零");
+    if (nodeErrorState("ECU_X") == "error-active")
+    {
+        recoveredStateOk = 1;
+    }
+    testAssertEquals(recoveredStateOk, 1, "恢复到 error-active");
+
+    /* --- 阶段 5：恢复后可以正常发送 --- */
+    denied = nodeSend("ECU_X", 0x300, 0x55);
+    testAssertEquals(denied, 1, "恢复后可以重新发送报文");
+    testAssertEquals(nodeTxSuccess("ECU_X"), 1, "并且成功发送计数 +1");
+
+    /* --- 阶段 6：另外两类错误（CRC / 填充）也能检出并计数 --- */
+    injectCrcError("ECU_Y");
+    nodeSend("ECU_Y", 0x301, 0x00);
+    testAssertEquals(errorCount("ECU_Y", "crc"), 1, "CRC 错误被检出");
+    testAssertEquals(nodeTec("ECU_Y"), 8, "一次 CRC 错误使 TEC += 8");
+
+    injectStuffError("ECU_Z", 0);
+    nodeSend("ECU_Z", 0x302, 0x00);
+    testAssertEquals(errorCount("ECU_Z", "stuff"), 1, "填充错误被检出");
+    testAssertEquals(nodeTec("ECU_Z"), 8, "一次填充错误使 TEC += 8");
+
+    /* --- 阶段 7：错误帧会破坏当前帧，接收方也计入 REC --- */
+    testAssertTrue(nodeRec("ECU_W") == 0, "未受影响的节点 REC 保持 0");
+
+    testCaseEnd();
+}

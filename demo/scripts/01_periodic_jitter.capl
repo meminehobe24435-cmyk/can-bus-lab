@@ -1,0 +1,126 @@
+/*----------------------------------------------------------------------------
+ * 01_periodic_jitter.capl
+ *
+ * 验证目标：**周期报文与周期抖动**
+ *
+ * 场景：
+ *   - 被测 ECU 用 msTimer 以 10 ms 为标称周期发送状态报文 0x123；
+ *   - 每次重装定时器时叠加一个**确定性伪随机**抖动（jitterMs），
+ *     模拟真实 ECU 里由中断延迟/任务调度引起的周期波动；
+ *   - 测试脚本在 on message 里测量**相邻两帧的间隔**，统计它相对标称
+ *     周期的偏差，并断言最大偏差不超过阈值。
+ *
+ * 为什么测间隔而不是测绝对时刻：定时器是"在当前时刻 + 周期"重装的，
+ * 逐次抖动会累积成相位漂移，用绝对时刻衡量会把漂移当成抖动。通信矩阵
+ * 里周期报文的容差要求（例如 ±10%）说的也是相邻间隔，所以测间隔才对得上。
+ *
+ * 抖动值来自确定性伪随机函数，同一 seed 下两次运行结果完全一致。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    /* ---- 被测 ECU 侧 ---- */
+    msTimer tPeriodic;
+    message 0x123 statusMsg;
+    int     tick;
+    int     periodTenthMs;        /* 标称周期，单位 0.1 ms：100 = 10.0 ms */
+    int     jitterAmplitude;      /* 抖动幅度，单位 0.1 ms */
+
+    /* ---- 测试脚本侧 ---- */
+    int     receivedFrames;
+    int     lastStamp;
+    int     maxDeviation;         /* 最大周期偏差，单位 0.1 ms */
+    int     sumDeviation;
+    int     deviationLimit;       /* 偏差阈值，单位 0.1 ms */
+}
+
+on timer tPeriodic
+{
+    int jitter;
+
+    tick = tick + 1;
+    statusMsg.byte(0) = tick & 0xFF;
+    statusMsg.byte(1) = (tick >> 8) & 0xFF;
+    statusMsg.byte(2) = getTickCount() & 0xFF;
+    statusMsg.byte(3) = (getTickCount() >> 8) & 0xFF;
+    output(statusMsg);
+    measurePeriod();
+
+    if (tick < 100)
+    {
+        /* 实际周期 = 标称周期 + 抖动（可能有正有负） */
+        jitter = jitterMs(tick, jitterAmplitude);
+        setTimer(tPeriodic, (periodTenthMs + jitter) / 10);
+    }
+}
+
+/* 测量在每个发送时刻完成：本脚本同时扮演"被测 ECU"与"测试脚本"两个角色，
+   因此直接量自己发出的每一帧的间隔（等价于总线监听器看到的周期）。
+
+   注：本框架里一个脚本节点不会把自己 output() 出去的帧当成"收到的报文"投递
+   回来（与关闭 loopback 的真实控制器一致），所以这里不用 on message。 */
+void measurePeriod()
+{
+    int stamp;
+    int interval;
+    int deviation;
+
+    receivedFrames = receivedFrames + 1;
+    stamp = getTickCount();
+
+    if (receivedFrames > 1)
+    {
+        interval = (stamp - lastStamp) * 10;      /* 换算成 0.1 ms 单位 */
+        deviation = interval - periodTenthMs;
+        if (deviation < 0)
+        {
+            deviation = -deviation;
+        }
+        if (deviation > maxDeviation)
+        {
+            maxDeviation = deviation;
+        }
+        sumDeviation = sumDeviation + deviation;
+    }
+    lastStamp = stamp;
+}
+
+on start
+{
+    testCaseBegin("periodic-10ms-jitter");
+
+    periodTenthMs = 100;
+    jitterAmplitude = 5;
+    deviationLimit = 20;
+
+    tick = 0;
+    receivedFrames = 0;
+    lastStamp = 0;
+    maxDeviation = 0;
+    sumDeviation = 0;
+
+    statusMsg.dlc = 8;
+    writeLine("[01] 启动 10 ms 周期报文，共 100 帧，抖动幅度 +-0.5 ms");
+    setTimer(tPeriodic, 10);
+}
+
+on stopMeasurement
+{
+    int average;
+
+    if (receivedFrames > 1)
+    {
+        average = sumDeviation / (receivedFrames - 1);
+    }
+
+    writeLine("[01] 测量帧数 = ", receivedFrames,
+              "，最大周期偏差 = ", maxDeviation, " (0.1ms)",
+              "，平均偏差 = ", average, " (0.1ms)");
+
+    testAssertEquals(tick, 100, "ECU 发送了 100 帧");
+    testAssertEquals(receivedFrames, 100, "测量点覆盖了 100 帧");
+    testAssertTrue(maxDeviation <= deviationLimit, "最大周期偏差未超过阈值 2.0 ms");
+    testAssertTrue(maxDeviation > 0, "抖动确实存在（偏差非零）");
+    testAssertInRange(average, 0, 10, "平均偏差在合理范围");
+    testCaseEnd();
+}

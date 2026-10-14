@@ -1,0 +1,94 @@
+/*----------------------------------------------------------------------------
+ * 04_arbitration.capl
+ *
+ * 验证目标：**CAN 逐位非优先破坏性仲裁（bit-wise nondestructive arbitration）**
+ *
+ * 场景：两个节点在同一时刻开始发送不同 ID 的报文。
+ *   - 节点 A 发 0x100（ID 数值小 -> 优先级高）
+ *   - 节点 B 发 0x200（ID 数值大 -> 优先级低）
+ *
+ * 期望行为（这正是 CAN 的核心机制）：
+ *   1. 逐位比较仲裁场，A 在第 3 位发出显性位 0 而 B 发出隐性位 1，
+ *      B 读到显性位后立刻退出仲裁、转为接收方 —— **没有数据被破坏**；
+ *   2. A 的报文先成功上线；
+ *   3. 总线空闲后 B 自动重发，最终也发送成功；
+ *   4. 因此"ID 小的先成功、ID 大的重发一次"，总线上没有任何碰撞丢失。
+ *
+ * 脚本还会再做一个 RTR vs 数据帧同 ID 的实验，以及一个三节点竞争实验。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    /* 三个竞争节点使用的报文（ID 越小优先级越高） */
+    message 0x100 msgA;
+    message 0x200 msgB;
+    message 0x150 msgC;
+    message 0x100 msgRtr;         /* 与 msgA 同 ID，用作 RTR 对比 */
+
+    int aFirstTick;
+    int bFirstTick;
+    int cFirstTick;
+    int aSent;
+    int bSent;
+    int cSent;
+    int orderIndex;
+    int firstId;
+}
+
+on start
+{
+    int retA;
+    int retB;
+    int retC;
+
+    testCaseBegin("arbitration-two-nodes");
+
+    msgA.dlc = 8;
+    msgA.byte(0) = 0xA1;
+    msgB.dlc = 8;
+    msgB.byte(0) = 0xB1;
+
+    /* --- 实验 1：两节点同时发送不同 ID --- */
+    writeLine("[04] 实验 1：节点 A(0x100) 与节点 B(0x200) 同时开始发送");
+    retA = busSend2("NODE_A", 0x100, 0xA1, "NODE_B", 0x200, 0xB1);
+    writeLine("[04]   busSend2 返回 = ", retA);
+
+    /* 仲裁记录里应该出现"A 赢、B 在某一'位'上失败" */
+    testAssertTrue(arbitrationCount() >= 1, "至少发生过一次仲裁");
+    testAssertEquals(arbitrationWinnerId(0), 0x100, "赢得仲裁的是 ID 较小的 0x100");
+    testAssertTrue(arbitrationLoserCount(0) >= 1, "仲裁中有节点失败");
+    testAssertEquals(arbitrationLoserId(0), 0x200, "失败者是 ID 较大的 0x200");
+    testAssertInRange(arbitrationLoserBit(0), 0, 11,
+                      "失败发生在仲裁场内部（第 0-11 位）");
+    testAssertEquals(arbitrationLoserRetries(0), 1, "失败者最终重发 1 次");
+
+    writeLine("[04]   赢家 id=0x", arbitrationWinnerId(0),
+              " 失败者 id=0x", arbitrationLoserId(0),
+              " 失败位=", arbitrationLoserBit(0),
+              " 重发次数=", arbitrationLoserRetries(0));
+
+    /* 两帧最终都成功发送，顺序必须是 0x100 在前 */
+    testAssertEquals(totalFramesSent(), 2, "两帧都成功发送（没有丢帧）");
+    testAssertEquals(frameIdAt(0), 0x100, "总线上第一帧是 0x100");
+    testAssertEquals(frameIdAt(1), 0x200, "总线上第二帧是 0x200");
+
+    /* --- 实验 2：数据帧与远程帧同 ID --- */
+    writeLine("[04] 实验 2：数据帧 0x100 与远程帧 0x100 同时发送");
+    msgRtr.dlc = 4;
+    retA = busSendDataRtr("DATA_NODE", 0x100, 0x11, "RTR_NODE", 0x100, 4);
+    testAssertTrue(arbitrationCount() >= 2, "实验 2 也产生了仲裁");
+    testAssertEquals(arbitrationWinnerId(1), 0x100, "数据帧赢得仲裁");
+    testAssertEquals(arbitrationLoserId(1), 0x100, "远程帧与数据帧同 ID");
+    writeLine("[04]   数据帧 vs 远程帧：赢家 id=0x", arbitrationWinnerId(1),
+              " 失败位=", arbitrationLoserBit(1));
+
+    /* --- 实验 3：三节点竞争 --- */
+    writeLine("[04] 实验 3：0x100 / 0x150 / 0x200 三节点同时发送");
+    retC = busSend3("N1", 0x100, 1, "N2", 0x150, 2, "N3", 0x200, 3);
+    testAssertTrue(arbitrationCount() >= 3, "三节点竞争也产生了仲裁");
+    testAssertEquals(arbitrationWinnerId(2), 0x100, "三节点竞争中 0x100 胜出");
+    testAssertTrue(arbitrationLoserCount(2) >= 2, "有两个节点在仲裁中失败");
+    testAssertEquals(totalFramesSent() >= 6, 1, "所有待发帧最终都上了总线");
+
+    testCaseEnd();
+}

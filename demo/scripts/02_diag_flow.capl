@@ -1,0 +1,334 @@
+/*----------------------------------------------------------------------------
+ * 02_diag_flow.capl
+ *
+ * 验证目标：**完整的 UDS 诊断流程**
+ *   会话切换(0x10) -> 安全访问(0x27) -> 写数据(0x2E) -> 读回校验(0x22) -> 复位(0x11)
+ *
+ * 拓扑（全部在脚本里显式建模，不依赖任何外部工具）：
+ *   - 测试脚本在 0x7DF 上发诊断请求；
+ *   - 一个用 CAPL 写成的**简化 ECU** 在 0x7E8 上应答。它的会话状态、安全等级、
+ *     DID 数据都用脚本变量表示，安全访问的种子-密钥算法在脚本里实现。
+ *
+ * 校验点：
+ *   1. 0x10 03 进入扩展会话，正响应 50 03 ... ；
+ *   2. 未解锁时读受保护 DID 返回 NRC 0x33（securityAccessDenied）；
+ *   3. 0x27 01 取种子 -> 送错误密钥得 NRC 0x35 -> 送正确密钥解锁；
+ *   4. 0x2E 写入 + 0x22 读回，数据一致；
+ *   5. 0x11 01 复位后会话回落默认、安全等级清零、内部数据保留。
+ *
+ * 注意脚本里的整型是 C 语义的 16 位有符号：所有按位运算都显式 & 0xFFFF。
+ *--------------------------------------------------------------------------*/
+
+variables
+{
+    /* ---- 测试仪侧 ---- */
+    message 0x7DF reqMsg;
+    int     step;
+
+    /* ---- 简化 ECU 侧 ---- */
+    message 0x7E8 respMsg;
+    int     ecuSession;
+    int     ecuSecurityLevel;
+    int     ecuDidValue;
+    int     ecuSeed;
+    int     ecuResetCount;
+    int     lastDid;
+
+    /* ---- 观测点：最近一条响应（由 on message 0x7E8 写入）---- */
+    int     respService;          /* 响应服务号（0x7F 表示负响应）*/
+    int     respSubOrNrc;         /* 正响应子功能 / 负响应 NRC */
+    int     respData;             /* 0x62 响应的数据字节 */
+    int     responseCount;
+}
+
+/*------------------------------------------------------------------
+ * 安全访问种子-密钥算法（自研，与 canlab.uds.default_key_algorithm 同构）
+ *
+ *   state = seed
+ *   重复 8 次： state = (state * 0x0801 + 0x1234 + level) & 0xFFFF
+ *   结果高低字节交换后输出
+ *
+ * 关键字面量必须显式用 & 0xFFFF 截断，因为脚本整型与 C 一样是定宽类型。
+ *------------------------------------------------------------------*/
+int computeKey(int seed, int level)
+{
+    int state;
+    int i;
+
+    state = seed & 0xFFFF;
+    for (i = 0; i < 8; i = i + 1)
+    {
+        state = (state * 0x0801 + 0x1234 + level) & 0xFFFF;
+    }
+    state = (((state & 0xFF) << 8) | ((state >> 8) & 0xFF)) & 0xFFFF;
+    return state;
+}
+
+/* 简化 ECU：处理一条诊断请求并应答 */
+void ecuHandleRequest()
+{
+    int service;
+    int sub;
+
+    service = reqMsg.byte(0) & 0xFF;
+    sub = reqMsg.byte(1) & 0x7F;
+    service = reqMsg.byte(0) & 0xFF;
+    sub = reqMsg.byte(1) & 0x7F;
+
+    /* 先把响应清零 */
+    respMsg.dlc = 8;
+    respMsg.byte(0) = 0;
+    respMsg.byte(1) = 0;
+    respMsg.byte(2) = 0;
+    respMsg.byte(3) = 0;
+    respMsg.byte(4) = 0;
+    respMsg.byte(5) = 0;
+    respMsg.byte(6) = 0;
+    respMsg.byte(7) = 0;
+
+    if (service == 0x10)
+    {
+        ecuSession = sub;
+        ecuSecurityLevel = 0;                 /* 切换会话会复位安全状态 */
+        respMsg.byte(0) = 0x03;
+        respMsg.byte(1) = 0x50;
+        respMsg.byte(2) = sub;
+        respMsg.byte(3) = 0x32;               /* P2 = 50 ms */
+        respMsg.byte(4) = 0x13;               /* P2* = 5000 ms */
+    }
+    else if (service == 0x22)
+    {
+        lastDid = ((reqMsg.byte(2) << 8) | reqMsg.byte(3)) & 0xFFFF;
+        if (lastDid == 0x1234 && ecuSecurityLevel == 0)
+        {
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x7F;
+            respMsg.byte(2) = 0x22;
+            respMsg.byte(3) = 0x33;           /* securityAccessDenied */
+        }
+        else if (lastDid == 0x1234)
+        {
+            respMsg.byte(0) = 0x04;
+            respMsg.byte(1) = 0x62;
+            respMsg.byte(2) = 0x12;
+            respMsg.byte(3) = 0x34;
+            respMsg.byte(4) = ecuDidValue & 0xFF;
+        }
+        else
+        {
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x7F;
+            respMsg.byte(2) = 0x22;
+            respMsg.byte(3) = 0x31;           /* requestOutOfRange */
+        }
+    }
+    else if (service == 0x27)
+    {
+        if (sub == 0x01)
+        {
+            ecuSeed = 0x1234;                 /* 固定种子，便于复现 */
+            respMsg.byte(0) = 0x04;
+            respMsg.byte(1) = 0x67;
+            respMsg.byte(2) = 0x01;
+            respMsg.byte(3) = (ecuSeed >> 8) & 0xFF;
+            respMsg.byte(4) = ecuSeed & 0xFF;
+        }
+        else if (sub == 0x02)
+        {
+            int key;
+            int expected;
+
+            key = ((reqMsg.byte(3) << 8) | reqMsg.byte(4)) & 0xFFFF;
+            expected = computeKey(ecuSeed, 1) & 0xFFFF;
+            if (key == expected)
+            {
+                ecuSecurityLevel = 1;
+                respMsg.byte(0) = 0x02;
+                respMsg.byte(1) = 0x67;
+                respMsg.byte(2) = 0x02;
+            }
+            else
+            {
+                respMsg.byte(0) = 0x03;
+                respMsg.byte(1) = 0x7F;
+                respMsg.byte(2) = 0x27;
+                respMsg.byte(3) = 0x35;       /* invalidKey */
+            }
+        }
+    }
+    else if (service == 0x2E)
+    {
+        lastDid = ((reqMsg.byte(2) << 8) | reqMsg.byte(3)) & 0xFFFF;
+        if (ecuSecurityLevel == 0)
+        {
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x7F;
+            respMsg.byte(2) = 0x2E;
+            respMsg.byte(3) = 0x33;
+        }
+        else
+        {
+            ecuDidValue = reqMsg.byte(4) & 0xFF;   /* 0x2E <DIDhi> <DIDlo> <data> */
+            respMsg.byte(0) = 0x03;
+            respMsg.byte(1) = 0x6E;
+            respMsg.byte(2) = (lastDid >> 8) & 0xFF;
+            respMsg.byte(3) = lastDid & 0xFF;
+        }
+    }
+    else if (service == 0x11)
+    {
+        ecuResetCount = ecuResetCount + 1;
+        ecuSession = 1;
+        ecuSecurityLevel = 0;
+        respMsg.byte(0) = 0x02;
+        respMsg.byte(1) = 0x51;
+        respMsg.byte(2) = sub;
+    }
+    else
+    {
+        respMsg.byte(0) = 0x03;
+        respMsg.byte(1) = 0x7F;
+        respMsg.byte(2) = service;
+        respMsg.byte(3) = 0x11;               /* serviceNotSupported */
+    }
+
+    output(respMsg);
+}
+
+/* 被测 ECU：收到 0x7DF 上的诊断请求就按 UDS 规则处理并应答 */
+on message 0x7DF
+{
+    ecuHandleRequest();
+}
+
+/* 观测点：把最近一条响应的关键字段记到全局变量里 */
+on message 0x7E8
+{
+    responseCount = responseCount + 1;
+    respService = this.byte(1) & 0xFF;
+    if (respService == 0x7F)
+    {
+        respSubOrNrc = this.byte(3) & 0xFF;
+    }
+    else
+    {
+        respSubOrNrc = this.byte(2) & 0xFF;
+    }
+    if (respService == 0x62)
+    {
+        /* 0x62 <DIDhi> <DIDlo> <data>：数据在第 4 字节 */
+        respData = this.byte(4) & 0xFF;
+    }
+}
+
+/* 测试仪：把请求写进 reqMsg 并发出去 */
+void sendRequest(int service, int sub, int didHigh, int didLow, int data)
+{
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = service & 0xFF;
+    reqMsg.byte(1) = sub & 0xFF;
+    reqMsg.byte(2) = didHigh & 0xFF;
+    reqMsg.byte(3) = didLow & 0xFF;
+    reqMsg.byte(4) = data & 0xFF;
+    reqMsg.byte(5) = 0;
+    reqMsg.byte(6) = 0;
+    reqMsg.byte(7) = 0;
+    output(reqMsg);
+}
+
+/* 发一次 0x27 02 密钥请求 */
+void sendKey(int key)
+{
+    reqMsg.dlc = 8;
+    reqMsg.byte(0) = 0x27;
+    reqMsg.byte(1) = 0x02;
+    reqMsg.byte(2) = 0x00;
+    reqMsg.byte(3) = (key >> 8) & 0xFF;
+    reqMsg.byte(4) = key & 0xFF;
+    reqMsg.byte(5) = 0;
+    reqMsg.byte(6) = 0;
+    reqMsg.byte(7) = 0;
+    output(reqMsg);
+}
+
+on start
+{
+    int seed;
+    int key;
+
+    testCaseBegin("uds-diagnostic-flow");
+
+    ecuSession = 1;
+    ecuSecurityLevel = 0;
+    ecuDidValue = 0;
+    ecuSeed = 0;
+    ecuResetCount = 0;
+    respService = 0;
+    respSubOrNrc = 0;
+    respData = 0;
+    responseCount = 0;
+
+    /* --- 步骤 1：进入扩展会话 --- */
+    writeLine("[02] step 1: 0x10 03 -> 进入扩展会话");
+    sendRequest(0x10, 0x03, 0, 0, 0);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到 0x10 响应");
+    testAssertEquals(respService, 0x50, "响应服务号 = 0x50");
+    testAssertEquals(respSubOrNrc, 3, "ECU 报告会话 = 扩展");
+    testAssertEquals(ecuSession, 3, "ECU 内部会话状态 = 扩展");
+
+    /* --- 步骤 2：未解锁读受保护 DID，应被拒 --- */
+    writeLine("[02] step 2: 0x22 1234 -> 未解锁应返回 NRC 0x33");
+    sendRequest(0x22, 0x00, 0x12, 0x34, 0);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到 0x22 响应");
+    testAssertEquals(respService, 0x7F, "响应是负响应");
+    testAssertEquals(respSubOrNrc, 0x33, "NRC = securityAccessDenied");
+
+    /* --- 步骤 3：安全访问 --- */
+    writeLine("[02] step 3: 0x27 01 取种子");
+    sendRequest(0x27, 0x01, 0, 0, 0);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到种子响应");
+    testAssertEquals(respService, 0x67, "响应服务号 = 0x67");
+    testAssertEquals(respSubOrNrc, 0x01, "子功能 = requestSeed");
+    seed = ecuSeed;
+    key = computeKey(seed, 1) & 0xFFFF;
+    writeLine("[02]      seed = ", seed, ", key = ", key);
+
+    writeLine("[02] step 3b: 发送错误密钥 -> 期望 NRC 0x35");
+    sendKey((key + 1) & 0xFFFF);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到错误密钥响应");
+    testAssertEquals(respSubOrNrc, 0x35, "NRC = invalidKey");
+    testAssertEquals(ecuSecurityLevel, 0, "错误密钥不解锁");
+
+    writeLine("[02] step 3c: 发送正确密钥 -> 期望解锁");
+    sendKey(key);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到解锁响应");
+    testAssertEquals(respService, 0x67, "响应服务号 = 0x67");
+    testAssertEquals(ecuSecurityLevel, 1, "安全等级已解锁");
+
+    /* --- 步骤 4：写数据并读回 --- */
+    writeLine("[02] step 4: 0x2E 写 0x1234 = 0xA5, 再 0x22 读回");
+    sendRequest(0x2E, 0x00, 0x12, 0x34, 0xA5);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到写入响应");
+    testAssertEquals(respService, 0x6E, "响应服务号 = 0x6E");
+    testAssertEquals(ecuDidValue, 0xA5, "ECU 内部数据已更新");
+
+    sendRequest(0x22, 0x00, 0x12, 0x34, 0);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到读取响应");
+    testAssertEquals(respService, 0x62, "响应服务号 = 0x62");
+    testAssertEquals(respData, 0xA5, "读回值与写入值一致");
+
+    /* --- 步骤 5：ECU 复位 --- */
+    writeLine("[02] step 5: 0x11 01 -> 复位");
+    sendRequest(0x11, 0x01, 0, 0, 0);
+    testAssertEquals(testWaitForMessage(0x7E8, 100), 0, "收到复位响应");
+    testAssertEquals(respService, 0x51, "响应服务号 = 0x51");
+    testAssertEquals(ecuResetCount, 1, "ECU 复位计数 = 1");
+    testAssertEquals(ecuSession, 1, "复位后回到默认会话");
+    testAssertEquals(ecuSecurityLevel, 0, "复位后安全等级清零");
+    testAssertEquals(ecuDidValue, 0xA5, "复位不影响已写入的数据");
+
+    writeLine("[02] 共收到 ", responseCount, " 条响应");
+
+    testAssertEquals(responseCount, 8, "一共完成 8 次请求/响应往返");
+    testCaseEnd();
+}
