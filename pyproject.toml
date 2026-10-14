@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "can-bus-lab"
+version = "1.0.0"
+description = "纯标准库实现的 CAN / CAN FD 总线仿真器与类 CAPL 脚本化测试框架"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "can-bus-lab contributors" }]
+keywords = ["can", "can-fd", "canbus", "isotp", "uds", "capl", "automotive", "testing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Education",
+    "Topic :: Software Development :: Testing",
+    "Topic :: System :: Networking",
+]
+# 生产代码零第三方依赖
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=6.0"]
+
+[project.urls]
+Homepage = "https://github.com/meminehobe24435-cmyk/can-bus-lab"
+Source = "https://github.com/meminehobe24435-cmyk/can-bus-lab"
+
+[project.scripts]
+canlab = "canlab.cli:main"
+
+[tool.setuptools]
+packages = ["canlab", "canlab.capl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra"

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.8", "3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Show Python version
+        run: python --version
+
+      - name: Install pytest
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run the full test suite
+        run: python -m pytest tests/ -q
+
+      - name: Run the built-in self test
+        run: python -m canlab selftest
+
+      - name: Run every demo script
+        shell: bash
+        run: |
+          set -e
+          mkdir -p out
+          for script in demo/scripts/*.capl; do
+            name="$(basename "$script" .capl)"
+            echo "=== $name ==="
+            python -m canlab run "$script" --report "out/$name.xml" --text-report "out/$name.txt"
+          done
+
+      - name: Verify reports were generated and are valid XML
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          xmls = sorted(glob.glob("out/*.xml"))
+          txts = sorted(glob.glob("out/*.txt"))
+          print("XML reports :", len(xmls))
+          print("text reports:", len(txts))
+          assert len(xmls) >= 5, "expected at least 5 JUnit XML reports"
+          assert len(txts) >= 5, "expected at least 5 text reports"
+
+          total_tests = 0
+          total_failures = 0
+          for path in xmls:
+              root = ET.parse(path).getroot()
+              assert root.tag == "testsuites", root.tag
+              tests = int(root.get("tests", "0"))
+              failures = int(root.get("failures", "0"))
+              errors = int(root.get("errors", "0"))
+              total_tests += tests
+              total_failures += failures + errors
+              print("%-40s tests=%d failures=%d errors=%d"
+                    % (os.path.basename(path), tests, failures, errors))
+              assert failures == 0 and errors == 0, "%s has failures" % path
+              assert tests > 0, "%s has no test cases" % path
+          print("TOTAL: %d test cases, %d failures" % (total_tests, total_failures))
+          assert total_failures == 0
+          assert total_tests >= 50
+          PY
+
+      - name: Verify determinism (same seed twice -> identical reports)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import subprocess
+          import sys
+
+          script = "demo/scripts/02_diag_flow.capl"
+          digests = []
+          for index in range(2):
+              out = "det_%d.txt" % index
+              subprocess.run(
+                  [sys.executable, "-m", "canlab", "run", script,
+                   "--text-report", out, "--quiet"],
+                  check=True,
+              )
+              with open(out, "rb") as handle:
+                  digests.append(hashlib.sha256(handle.read()).hexdigest())
+          print("run 1:", digests[0])
+          print("run 2:", digests[1])
+          assert digests[0] == digests[1], "two runs produced different reports"
+          PY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: canlab-reports-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: out/
+          if-no-files-found: warn
