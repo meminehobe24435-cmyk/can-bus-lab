@@ -380,12 +380,15 @@ $ python -m pytest tests/ -q
 **CI 实跑结果（绿）**：4 个 job 全部通过，两个平台、两个 Python 版本上
 都是 `1065 passed`，6 个 demo 报告合计 `cases=6 assertions=114 failures=0 errors=0`。
 
-运行记录：[CI run #38625444437](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/runs/38625444437)
-（commit `dcc4397`）
+| 运行记录 | 提交 | 结论 |
+|---------|------|------|
+| [CI run #38625817575](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/runs/38625817575) | `1f8b4d8`（当前 main） | ✅ 4/4 job 通过 |
+| [CI run #38625444437](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/runs/38625444437) | `dcc4397` | ✅ 4/4 job 通过 |
+| [CI run #38624738719](https://github.com/meminehobe24435-cmyk/can-bus-lab/actions/runs/38624738719) | `a06b733` | ❌ 首次运行，cp1252 编码问题（见下） |
 
-> 附注：CI 第一次跑是**红的**——不是逻辑问题，而是 `canlab selftest` 在 Windows runner
+> 附注：CI 第一次跑是**红的**——不是协议逻辑问题，而是 `canlab selftest` 在 Windows runner
 > 上撞了 `UnicodeEncodeError`（runner 的 stdout 编码是 cp1252，而工具会打印中文）。
-> 修法与排查过程记在下面的「踩到的坑」第 13、14 条。
+> 修法与排查过程记在下面的「踩到的坑」第 13、14 条，第一次失败的运行记录也保留在上面。
 
 ---
 
