@@ -44,7 +44,7 @@ CANoe 和 TSMaster（同星）都是商业工具，需要许可证。这个项�
 - 一个 ISO 15765-2 (ISO-TP) 传输层实现（SF/FF/CF/FC、块大小、STmin、六类超时）
 - 一个 ISO 14229-1 (UDS) 诊断服务子集（9 个服务 + 15 个 NRC，服务端与客户端都有）
 - 一个**自研的类 CAPL 脚本引擎**（词法分析 / 递归下降语法分析 / 解释器 / 虚拟时间调度器）
-- 一套 1059 个 pytest 用例 + 6 个用脚本写的真实测试场景 + JUnit XML/文本报告
+- 一套 1065 个 pytest 用例 + 6 个用脚本写的真实测试场景 + JUnit XML/文本报告
 
 **不是什么**
 
@@ -198,7 +198,7 @@ python -m canlab run my_test.capl --report my_test.xml
 ### 1. 测试
 
 ```
-1059 passed in 18.02s
+1065 passed in 18.04s
 ```
 
 （截图式原文来自 `python -m pytest tests/ -q`；不含"跳过/警告"以外的任何隐藏项。）
@@ -347,10 +347,10 @@ STmin = 0 时耗时（对照）           : 0.0 ms
 
 ```
 $ python -m pytest tests/ -q
-1059 passed in 18.02s
+1065 passed in 18.04s
 ```
 
-测试分布（8 个文件、5394 行）：
+测试分布（9 个文件、5464 行）：
 
 | 文件 | 覆盖内容 |
 |------|---------|
@@ -362,6 +362,7 @@ $ python -m pytest tests/ -q
 | `tests/test_capl.py` | 词法（含错误）、语法（含错误）、运算符全覆盖、控制流、定宽整型语义、事件派发、定时器、测试原语、确定性 |
 | `tests/test_report.py` | JUnit XML 结构与可解析性、文本报告、文件写出、报告逐字节可复现 |
 | `tests/test_e2e.py` | 6 个 demo 全部跑通、报告生成、CLI 各子命令、跨进程确定性、全栈串联（位级→总线→ISO-TP→UDS） |
+| `tests/test_cli_encoding.py` | CLI 的 UTF-8 输出自适配（Windows CI 上 stdout 是 cp1252 时会撞 `UnicodeEncodeError`，这个用例锁住修复） |
 
 ### CI
 
@@ -616,11 +617,39 @@ demo 06 里发送方发满一个块（BS=4）后进入"等下一个流控帧"，
 
 跨进程比较 CLI 输出时一直失败，diff 出来发现差异全在**临时目录路径**上
 （`...\tmpXXXX\r.xml` vs `...\tmpYYYY\r.xml`）。报告本身（XML 与文本报告文件）
-是逐字节一致的。
+是逐字节一致的。顺手修掉了另一个更隐蔽的问题：CLI 原来把**完整脚本路径**写进
+报告，于是报告内容依赖运行位置；改成只写文件名之后，换台机器跑同样的脚本也能
+得到逐字节一致的产物。
 
 另外 PowerShell 里用 here-string 传中文给 `python -c` 会被按 GBK 弄乱，
 所以仓库里所有含中文的脚本与文档都用文件写入工具落盘，
 不用 `python -c "…中文…"` 这种形式。
+
+### 13. CI 假红：Windows runner 上 stdout 是 cp1252
+
+第一次跑 CI 时，Ubuntu 与 Windows 的**测试全部通过**，但 `canlab selftest` 这一步
+红了：
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 12-13
+```
+
+根因：本地我一直带着 `$env:PYTHONIOENCODING='utf-8'`，而 CI 里没有。Windows runner 的
+标准输出编码是 cp1252（英文系统的代码页），一打印中文就炸。这不是"CI 环境有问题"，
+而是**工具本身的可移植性缺陷**——一个命令行工具不该要求调用方先设置环境变量。
+
+修法：CLI 启动时主动把 `sys.stdout` / `sys.stderr` 重配置成 UTF-8
+（`stream.reconfigure(encoding="utf-8")`，并用 `getattr` 兜底不支持重配置的流对象），
+同时补了 `tests/test_cli_encoding.py` 把"cp1252 stdout 下也能打印中文"锁进回归测试。
+另外 CI 里"XML 报告用例数 >= 50"这个断言也是我自己写错的：JUnit 报告里的 `testcase`
+数是**脚本声明的用例数**，断言数记在 properties 里，两者不该混为一谈。
+
+### 14. cp1252 的连带失败：确定性校验
+
+同一个编码问题还让 CI 里"同 seed 两次运行报告逐字节一致"这一步红了——因为那一步通过
+`subprocess.run([...])` 调用 CLI，子进程同样没有 `PYTHONIOENCODING`，于是子进程直接
+崩在 `UnicodeEncodeError` 上。一个编码问题同时打红两个看起来无关的步骤，
+这也是"CI 红要多看几层日志"的原因。
 
 ---
 

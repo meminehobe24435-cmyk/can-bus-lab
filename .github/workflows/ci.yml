@@ -66,23 +66,34 @@ jobs:
           assert len(xmls) >= 5, "expected at least 5 JUnit XML reports"
           assert len(txts) >= 5, "expected at least 5 text reports"
 
-          total_tests = 0
+          total_cases = 0
+          total_assertions = 0
           total_failures = 0
           for path in xmls:
               root = ET.parse(path).getroot()
               assert root.tag == "testsuites", root.tag
-              tests = int(root.get("tests", "0"))
+              cases = int(root.get("tests", "0"))
               failures = int(root.get("failures", "0"))
               errors = int(root.get("errors", "0"))
-              total_tests += tests
+              # 断言总数记在 testsuite 的 properties 里
+              assertions = 0
+              for prop in root.iter("property"):
+                  if prop.get("name") == "assertions":
+                      assertions = int(prop.get("value", "0"))
+              total_cases += cases
+              total_assertions += assertions
               total_failures += failures + errors
-              print("%-40s tests=%d failures=%d errors=%d"
-                    % (os.path.basename(path), tests, failures, errors))
+              print("%-40s cases=%d assertions=%d failures=%d errors=%d"
+                    % (os.path.basename(path), cases, assertions, failures, errors))
               assert failures == 0 and errors == 0, "%s has failures" % path
-              assert tests > 0, "%s has no test cases" % path
-          print("TOTAL: %d test cases, %d failures" % (total_tests, total_failures))
+              assert cases > 0, "%s has no test cases" % path
+              assert assertions > 0, "%s has no assertions" % path
+          print("TOTAL: %d test cases, %d assertions, %d failures"
+                % (total_cases, total_assertions, total_failures))
           assert total_failures == 0
-          assert total_tests >= 50
+          # 每个 demo 至少声明一个用例；6 个 demo 的断言总数远超 50
+          assert total_cases >= len(xmls)
+          assert total_assertions >= 50
           PY
 
       - name: Verify determinism (same seed twice -> identical reports)

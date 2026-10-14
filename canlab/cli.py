@@ -285,8 +285,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_output() -> None:
+    """把标准输出与标准错误切成 UTF-8。
+
+    Windows 上 ``sys.stdout`` 默认使用本地代码页（中文系统是 cp936、英文系统是
+    cp1252）。本工具的输出里有中文，一旦标准输出不是管道而是被重定向或跑在
+    CI 里，默认编码会让你直接撞上 ``UnicodeEncodeError: 'charmap' codec can't
+    encode character``。这里统一切到 UTF-8，与 ``open(..., encoding="utf-8")``
+    的写文件行为保持一致。
+
+    调用方不需要预先设置 ``PYTHONIOENCODING``；如果环境确实不支持重配置
+    （例如把某个自定义流对象替给了 sys.stdout），就静默跳过。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8")
+        except (ValueError, OSError):        # pragma: no cover - 环境相关
+            pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     """命令行主入口。"""
+    _force_utf8_output()
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     if not getattr(args, "command", None):
